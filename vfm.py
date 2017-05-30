@@ -1,37 +1,21 @@
-
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-import torch.nn.functional as F
-import chairs_loader as chairs
-from chairs_loader import ChairsDataset
-import numpy as np
-import cv2
-import torch.optim as optim
-import os
-from tensorboard_logger import configure, log_value
-import argparse
-
-parser = argparse.ArgumentParser(description='vfm')
-parser.add_argument('--model', type=str, default="runs/A", metavar='G',
-                    help='model path')
-args = parser.parse_args()
-
-configure(args.model, flush_secs=5)
 
 s=16
-img_size = 64
-rnn_size = 512
-rnn_input_size = 256
-layers = 1
-batch_size = 32
-z_size = 128
-action_size = 2
+rnn_layers = 1
 
 class VFM(nn.Module):
 
-    def __init__(self):
+    def __init__(self, img_size=64, action_size=2, z_size=32, rnn_input_size=256, rnn_size=512, batch_size=32,
+                 in_len=10, out_len=10):
         super(VFM, self).__init__()
+
+        self.batch_size = batch_size
+        self.rnn_size = rnn_size
+        self.img_size = img_size
+        self.in_len = in_len
+        self.out_len = out_len
 
         self.en = torch.nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
@@ -49,7 +33,7 @@ class VFM(nn.Module):
             torch.nn.ELU()
         )
 
-        self.rnn = nn.LSTM(rnn_input_size, rnn_size, layers, batch_first=True)
+        self.rnn = nn.LSTM(rnn_input_size, rnn_size, rnn_layers, batch_first=True)
 
         self.mean = nn.Linear(rnn_size, z_size)
         self.logvar = nn.Linear(rnn_size, z_size)
@@ -79,7 +63,7 @@ class VFM(nn.Module):
         return eps.mul(std).add_(mu)
 
     def encode(self, x, acts):
-        x = x.view(batch_size*chairs.steps, 3, img_size, img_size)
+        x = x.view(self.batch_size*self.in_len, 3, self.img_size, self.img_size)
         h = self.en(x)
 
         img_enc = h.view(-1, s*s*128)
@@ -87,30 +71,30 @@ class VFM(nn.Module):
 
         h = self.en2(torch.cat([img_enc, acts], dim=1))
 
-        rnn_h = Variable(torch.zeros(layers, batch_size, rnn_size)).cuda()
-        rnn_c = Variable(torch.zeros(layers, batch_size, rnn_size)).cuda()
-        h = h.view(batch_size, chairs.steps, -1)
+        rnn_h = Variable(torch.zeros(rnn_layers, self.batch_size, self.rnn_size)).cuda()
+        rnn_c = Variable(torch.zeros(rnn_layers, self.batch_size, self.rnn_size)).cuda()
+        h = h.view(self.batch_size, self.seq_len, -1)
 
         h, (_, _) = self.rnn(h, (rnn_h, rnn_c))
 
-        h = h.contiguous().view(batch_size*chairs.steps, rnn_size)
+        h = h.contiguous().view(self.batch_size*self.seq_len, self.rnn_size)
 
         mean = self.mean(h)
         logvar = self.logvar(h)
 
         z = self.reparameterize(mean, logvar)
 
-        mean = mean.view(batch_size, chairs.steps, -1)
-        logvar = logvar.view(batch_size, chairs.steps, -1)
+        mean = mean.view(self.batch_size, self.seq_len, -1)
+        logvar = logvar.view(self.batch_size, self.seq_len, -1)
 
         return z, mean, logvar
 
     def decode(self, z):
-        z = z.view(batch_size*chairs.steps, -1)
+        z = z.view(self.batch_size*self.seq_len, -1)
         #print(z.size())
         h = self.de(z)
         out = self.de2(h.view(-1, 128, s, s))
-        out = out.view(batch_size, chairs.steps, 3, img_size, img_size)
+        out = out.view(self.batch_size, self.seq_len, 3, self.img_size, self.img_size)
 
         return out
 
@@ -140,120 +124,4 @@ def repackage_hidden(h):
     else:
         return tuple(repackage_hidden(v) for v in h)
 
-def train():
-    train_loader = torch.utils.data.DataLoader(
-        ChairsDataset(chairs.train_chairs),
-        batch_size=batch_size, shuffle=True,
-        num_workers=8, pin_memory=False, drop_last=True)
 
-    test_loader = torch.utils.data.DataLoader(
-        ChairsDataset(chairs.test_chairs),
-        batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=False, drop_last=True)
-
-    model = VFM().cuda()
-    epoch = 0
-
-    if os.path.isfile('{}/checkpoint.tar'.format(args.model)):
-        checkpoint = torch.load('{}/checkpoint.tar'.format(args.model))
-        epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        print("=> loaded checkpoint (epoch {})"
-              .format(checkpoint['epoch']))
-
-    # model.apply(weights_init)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    # hidden = model.init_hidden(args.batch_size)
-
-    while True:
-        torch.save({
-            'epoch': epoch,
-            'state_dict': model.state_dict()
-        }, '{}/checkpoint.tar'.format(args.model))
-
-        def run(train):
-            total_loss = 0
-
-            if train:
-                title = "train"
-            else:
-                title = "test"
-
-            if train:
-                loader = train_loader
-            else:
-                loader = test_loader
-
-            for i, (mat1, act, mat2) in enumerate(loader):
-                x = Variable(mat1).cuda()
-                y = Variable(mat2).cuda()
-
-                acts = Variable(act).cuda()
-
-                # hidden = repackage_hidden(hidden)
-                optimizer.zero_grad()
-                recon, mean, logvar = model.forward(x, acts)
-
-                #if train:
-                loss = model.loss(y, recon, mean, logvar)
-                total_loss += loss.data[0]
-                loss.backward()
-
-                if train:
-                    optimizer.step()
-
-                x_img = np.hstack([np.moveaxis(x.data.cpu().numpy()[0, m, ...], 0, -1) for m in range(chairs.steps)])
-                y_img = np.hstack([np.moveaxis(y.data.cpu().numpy()[0, m, ...], 0, -1) for m in range(chairs.steps)])
-                pred_img = np.hstack([np.moveaxis(recon.data.cpu().numpy()[0, m, ...], 0, -1) for m in range(chairs.steps)])
-
-                cv2.imshow(title, np.vstack([x_img, y_img, pred_img]))
-                cv2.waitKey(1)
-
-                if train:
-                    log_value("{} loss".format(title), loss.data[0], i + epoch * len(train_loader))
-
-                    print("epoch {}, step {}/{}: {}".format(epoch, i, len(train_loader), loss.data[0]))
-
-                print(act.numpy()[0])
-
-
-            epoch_loss = total_loss / len(loader)
-            log_value('epoch {} loss'.format(title), epoch_loss, epoch)
-            print("AVG LOSS: {}".format(epoch_loss))
-
-        run(True)
-        run(False)
-        epoch += 1
-
-def lerp():
-    global batch_size
-    batch_size = 1
-    chairs.steps = 1
-
-    model = VFM().cuda()
-
-    if os.path.isfile('{}/checkpoint.tar'.format(args.model)):
-        checkpoint = torch.load('{}/checkpoint.tar'.format(args.model))
-        model.load_state_dict(checkpoint['state_dict'])
-        print("=> loaded checkpoint (epoch {})"
-              .format(checkpoint['epoch']))
-
-
-    while True:
-        print("generating")
-        lerps = []
-        start = np.random.uniform(-2, 2, (1, z_size))
-        end = np.random.uniform(-2, 2, (1, z_size))
-
-        for x in np.linspace(0, 1, 10):
-            gen = model.decode(Variable(torch.FloatTensor(end*x+start*(1-x))).cuda())
-            lerps.append(np.moveaxis(gen.data.cpu().numpy()[0, 0, ...], 0, -1))
-
-        cv2.imshow("lerp", np.hstack(lerps))
-        cv2.waitKey(0)
-        #cv2.imwrite("image-{}.png".format(k), np.hstack(lerps))
-        print("generated ")
-
-if __name__ == "__main__":
-    #train()
-    lerp()
