@@ -49,7 +49,7 @@ class VFM(nn.Module):
 
         self.a2h = nn.Linear(action_size, rnn_size)
 
-        self.rnn_cell = nn.LSTMCell(rnn_input_size, rnn_size)
+        self.rnn_cell = nn.LSTMCell(rnn_input_size + action_size, rnn_size)
         #self.rnn = nn.LSTM(rnn_input_size, rnn_size, rnn_layers, batch_first=True)
         #self.rnn2 = nn.LSTM(rnn_input_size, rnn_size, rnn_layers, batch_first=True)
 
@@ -59,8 +59,8 @@ class VFM(nn.Module):
 
         if var:
             self.de = torch.nn.Sequential(
-                nn.BatchNorm1d(z_size),
-                nn.Linear(z_size, s),
+                nn.BatchNorm1d(z_size + action_size),
+                nn.Linear(z_size + action_size, s),
                 torch.nn.ELU(),
                 nn.BatchNorm1d(s),
             )
@@ -104,25 +104,35 @@ class VFM(nn.Module):
         img_enc = h.view(-1, s)
         img_enc = self.en2(img_enc)
 
+        hs = []
+
         rnn_h = Variable(torch.zeros(self.batch_size, self.rnn_size)).cuda()
         rnn_c = Variable(torch.zeros(self.batch_size, self.rnn_size)).cuda()
         img_enc = img_enc.view(self.batch_size, self.in_len, -1)
 
         for i in range(self.in_len):
-            rnn_h, rnn_c = self.rnn_cell(img_enc[:, i, :], (rnn_h, rnn_c))
-            rnn_h = self.h2h(rnn_h) * self.a2h(acts_encode[:, i, :])
+            rnn_h, rnn_c = self.rnn_cell(torch.cat([img_enc[:, i, :], acts_encode[:, i, :]], 1), (rnn_h, rnn_c))
+            #rnn_h = self.h2h(rnn_h) * self.a2h(acts_encode[:, i, :])
+            hs.append(rnn_h)
 
         gen_imgs = []
         means = []
         logvars = []
         rnn_h = Variable(rnn_h.data, requires_grad=False)
 
+        #     -2-1
+        #        | | | | |
+        #+-+-+-+-+-+-+-+-+
+        #| | | | | 
+
         if var:
-            mean = self.mean(rnn_h)
-            logvar = self.logvar(rnn_h)
+            mean = self.mean(hs[-2])
+            logvar = self.logvar(hs[-2])
             means.append(mean)
             logvars.append(logvar)
-            img_pred = self.de(self.reparameterize(mean, logvar))
+            z = self.reparameterize(mean, logvar)
+            #print(z.size(), acts_encode[:, -1, :].size())
+            img_pred = self.de(torch.cat([z, acts_encode[:, -1, :]], 1))
         else:
             img_pred = self.de(h)
 
@@ -134,24 +144,28 @@ class VFM(nn.Module):
         img_enc = self.en2(img_enc.view(-1, s))
 
         for i in range(self.out_len-1):
-            rnn_h = self.h2h(rnn_h) * self.a2h(acts_decode[:, i, :])
-            rnn_h, rnn_c = self.rnn_cell(img_enc, (rnn_h, rnn_c))
+            #rnn_h = self.h2h(rnn_h) * self.a2h(acts_decode[:, i, :])
+            
 
-            if var:
-                mean = self.mean(rnn_h)
-                logvar = self.logvar(rnn_h)
-                means.append(mean)
-                logvars.append(logvar)
-                img_pred = self.de(self.reparameterize(mean, logvar))
+            if i == 0:
+                h_z = hs[-1]
             else:
-                img_pred = self.de(rnn_h)
+                h_z = rnn_h
+                rnn_h, rnn_c = self.rnn_cell(torch.cat([img_enc, acts_decode[:, i, :]], 1), (rnn_h, rnn_c))
 
+            mean = self.mean(h_z)
+            logvar = self.logvar(h_z)
+            means.append(mean)
+            logvars.append(logvar)
+            z = self.reparameterize(mean, logvar)
+            #print(z.size(), acts_decode[:, i, :].size())
+            img_pred = self.de(torch.cat([z, acts_decode[:, i, :]], 1))
             img_pred = self.de2(img_pred.view(self.batch_size, 32, size, size))
-            gen_img = img_pred
-            gen_imgs.append(gen_img)
-            img_pred = Variable(gen_img[:, :3, ...].data, requires_grad=False)
+            
+            gen_imgs.append(img_pred)
+            img_pred = Variable(img_pred[:, :3, ...].data, requires_grad=False)
             img_enc = self.en(img_pred)
-            img_enc = self.en2(img_enc.view(-1, s))
+            img_enc = self.en2(img_enc.view(-1, s))            
 
         gen_imgs = torch.stack(gen_imgs, 1)
         mean = torch.stack(means, 0)
