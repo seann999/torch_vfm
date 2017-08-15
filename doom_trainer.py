@@ -39,10 +39,10 @@ def train_doom():
     action_size = 4
     batch_size = 16
     in_len = 5
-    out_len = 5
-    rnn_input_size = 1024
-    rnn_size = 1024
-    z_size = 128
+    out_len = 3
+    rnn_input_size = 256
+    rnn_size = 256
+    z_size = 32
 
     model = VFM(img_size=img_size, action_size=action_size, batch_size=batch_size,
                 in_len=in_len, out_len=out_len, rnn_input_size=rnn_input_size, rnn_size=rnn_size, z_size=z_size).cuda()
@@ -60,9 +60,9 @@ def train_doom():
               .format(checkpoint['iters']))
 
         del checkpoint
-    else:
-        torch.nn.init.normal(model.mean.weight, 0, 0.1)
-        torch.nn.init.normal(model.logvar.weight, 0, 0.1)
+    #else:
+    #    torch.nn.init.normal(model.mean.weight, 0, 0.1)
+    #    torch.nn.init.normal(model.logvar.weight, 0, 0.1)
 
     game.new_episode()
     model.train()
@@ -117,7 +117,7 @@ def train_doom():
                 elif len(target_images) < out_len:
                     target_images.append(img)
 
-                    if len(decoder_actions) < out_len - 1:
+                    if len(decoder_actions) < out_len:
                         decoder_actions.append(action)
                 else:
                     #print(len(encoder_actions), len(decoder_actions))
@@ -163,29 +163,18 @@ def train_doom():
 
         optimizer.zero_grad()
 
-        recon, mean, logvar = model.forward(x, acts, acts2)
-        loss, mse, kld = model.loss(target_x, recon, mean, logvar)
+        recon, pred, q_means, q_logvars, p_means, p_logvars = model.forward(x, acts, acts2)
+        #loss, mse, kld = model.loss(target_x, recon, q_means, q_logvars, p_means, p_logvars)
+
+        target = torch.cat([x[:, 1:, ...], target_x[:, :1, ...]], 1)
+        loss, mse, kld = model.loss(target, recon, q_means, q_logvars, p_means, p_logvars)
 
         recon = recon.data.cpu().numpy()
+        pred = pred.data.cpu().numpy()
         #print(x_np.shape)
         #print(target_x_np.shape)
-        canvas = np.hstack([np.moveaxis(x_np[0,i], 0, 2) for i in range(in_len)] + [np.moveaxis(target_x_np[0,i], 0, 2) for i in range(target_x_np.shape[1])])
-        pred_imgs = []
 
-        for i in range(recon.shape[1]):
-            mat = np.moveaxis(recon[0, i, :3, ...], 0, 2).copy()
-
-            avg_var = np.mean(np.exp(logvar[0, i, :].data.cpu().numpy()))
-            cv2.putText(mat, str(avg_var), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255))
-
-            if i > 0:
-                a = batch_decoder_actions[0][i-1]
-            else:
-                a = batch_encoder_actions[0][-1]
-
-            a = np.argmax(a)
-            past_stats[a] = 0.99 * past_stats[a] + 0.01 * avg_var
-            
+        def a2str(a):
             if a == 0:
                 a = "left"
             elif a == 1:
@@ -195,11 +184,50 @@ def train_doom():
             else:
                 a = "idle"
 
-            cv2.putText(mat, str(a), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255))
+            return a
+
+        input_images, output_images = [], []
+
+        for i in range(in_len):
+            im = np.moveaxis(x_np[0,i], 0, 2).copy()
+
+            if i >= 1:
+                a = batch_encoder_actions[0][i-1]
+                a = np.argmax(a)
+                #past_stats[a] = 0.99 * past_stats[a] + 0.01 * avg_var
+                text = a2str(a)
+                cv2.putText(im, str(text), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255))
+
+            input_images.append(im)
+
+        for i in range(out_len):
+            im = np.moveaxis(target_x_np[0,i], 0, 2).copy()
+
+            if i == 0:
+                a = batch_encoder_actions[0][-1]
+            else:
+                a = batch_decoder_actions[0][i-1]
+
+            a = np.argmax(a)
+            #past_stats[a] = 0.99 * past_stats[a] + 0.01 * avg_var
+            text = a2str(a)
+            cv2.putText(im, str(text), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255))
+            output_images.append(im)
+
+        canvas = np.hstack(input_images + output_images)
+        pred_imgs = []
+
+        for i in range(pred.shape[1]):
+            mat = np.moveaxis(pred[0, i], 0, 2).copy()
+
+            avg_var = np.mean(np.exp(p_logvars[0, i, :].data.cpu().numpy()))
+            cv2.putText(mat, str(avg_var), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255))
+
             pred_imgs.append(mat)
 
-        canvas2 = np.hstack(
-            [np.zeros([img_size, img_size, 3]) for i in range(in_len)] + pred_imgs)
+        #canvas2 = np.hstack(
+        #    [np.zeros([img_size, img_size, 3]) for i in range(in_len)] + pred_imgs)
+        canvas2 = np.hstack([np.moveaxis(recon[0, i], 0, 2) for i in range(in_len)] + pred_imgs)
         #print(canvas.shape)
         #print(canvas2.shape)
         canvas = np.vstack([canvas, canvas2])
@@ -212,17 +240,17 @@ def train_doom():
         #cv2.imwrite("{}.png".format(int(time.time())), canvas[:,:,[2,1,0]] * 255.0)
 
         loss.backward()
-        #torch.nn.utils.clip_grad_norm(model.parameters(), 40)
+        torch.nn.utils.clip_grad_norm(model.parameters(), 40)
         optimizer.step()
 
-        print(past_stats)
+        #print(past_stats)
         print("{}: {}".format(iters, loss.data[0]))
 
         log_value("loss", loss.data[0], iters)
         log_value("mse", mse.data[0], iters)
         log_value("kld", kld.data[0], iters)
-        log_value("mean", mean.mean().data[0], iters)
-        log_value("logvar", logvar.mean().data[0], iters)
+        log_value("mean", p_means.mean().data[0], iters)
+        log_value("logvar", p_logvars.mean().data[0], iters)
         iters += 1
 
 if __name__ == "__main__":

@@ -6,8 +6,6 @@ s=32*11*11
 size = 11
 rnn_layers = 1
 
-var = True
-
 class VFM(nn.Module):
 
     def __init__(self, img_size=64, action_size=2, z_size=32, rnn_input_size=256, rnn_size=512, batch_size=32,
@@ -20,69 +18,72 @@ class VFM(nn.Module):
         self.in_len = in_len
         self.out_len = out_len
         self.action_size = action_size
-        self.reconstruction_function = nn.BCELoss()
-        self.reconstruction_function.size_average = False
+        #self.reconstruction_function = nn.BCELoss()
+        #self.reconstruction_function.size_average = False
         self.z_size = z_size
 
-        self.en = torch.nn.Sequential(
+        self.q_en = torch.nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=8, stride=2, padding=(0,0)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(64),
+            #nn.BatchNorm2d(64),
             nn.Conv2d(64, 32, kernel_size=6, stride=2, padding=(1,1)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(32),
+            #nn.BatchNorm2d(32),
             nn.Conv2d(32, 32, kernel_size=6, stride=2, padding=(1,1)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(32),
+            #nn.BatchNorm2d(32),
             nn.Conv2d(32, 32, kernel_size=4, stride=2, padding=(0,0)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(32),
+            #nn.BatchNorm2d(32)
         )
 
-        self.en2 = torch.nn.Sequential(
+        self.q_en2 = torch.nn.Sequential(
             nn.Linear(s, rnn_input_size),
             torch.nn.ELU(),
             nn.BatchNorm1d(rnn_input_size),
         )
 
-        self.h2h = nn.Linear(rnn_size, rnn_size)
+        self.rnn_cell = nn.GRUCell(rnn_input_size + action_size, rnn_size)
 
-        self.a2h = nn.Linear(action_size, rnn_size)
+        self.qz_mean = torch.nn.Sequential(
+            nn.Linear(rnn_size, 256),
+            torch.nn.ELU(),
+            nn.Linear(256, z_size)
+        )
+        self.qz_logvar = torch.nn.Sequential(
+            nn.Linear(rnn_size, 256),
+            torch.nn.ELU(),
+            nn.Linear(256, z_size)
+        )
 
-        self.rnn_cell = nn.LSTMCell(rnn_input_size + action_size, rnn_size)
-        #self.rnn = nn.LSTM(rnn_input_size, rnn_size, rnn_layers, batch_first=True)
-        #self.rnn2 = nn.LSTM(rnn_input_size, rnn_size, rnn_layers, batch_first=True)
+        self.pz_en = torch.nn.Sequential(
+            nn.Linear(z_size + action_size, 256),
+            torch.nn.ELU(),
+            nn.Linear(256, 256),
+            torch.nn.ELU(),
+            #nn.BatchNorm1d(256),
+        )
 
-        if var:
-            self.mean = nn.Linear(rnn_size, z_size)
-            self.logvar = nn.Linear(rnn_size, z_size)
+        self.pz_mean = nn.Linear(256, z_size)
+        self.pz_logvar = nn.Linear(256, z_size)
 
-        if var:
-            self.de = torch.nn.Sequential(
-                nn.BatchNorm1d(z_size + action_size),
-                nn.Linear(z_size + action_size, s),
-                torch.nn.ELU(),
-                nn.BatchNorm1d(s),
-            )
-        else:
-            self.de = torch.nn.Sequential(
-                nn.BatchNorm1d(z_size),
-                nn.Linear(rnn_size, s),
-                torch.nn.ELU(),
-                nn.BatchNorm1d(s),
-            )
+        self.de = torch.nn.Sequential(
+            nn.Linear(z_size, s),
+            torch.nn.ELU(),
+            #nn.BatchNorm1d(s),
+        )
 
         self.de2 = torch.nn.Sequential(
             nn.ConvTranspose2d(32, 32, kernel_size=4, stride=2, padding=(0,0)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(32),
+            #nn.BatchNorm2d(32),
             nn.ConvTranspose2d(32, 32, kernel_size=6, stride=2, padding=(1,1)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(32),
+            #nn.BatchNorm2d(32),
             nn.ConvTranspose2d(32, 64, kernel_size=6, stride=2, padding=(1,1)),
             torch.nn.ELU(),
-            nn.BatchNorm2d(64),
-            nn.ConvTranspose2d(64, 6, kernel_size=8, stride=2, padding=(0,0)),
+            #nn.BatchNorm2d(64),
+            nn.ConvTranspose2d(64, 3, kernel_size=8, stride=2, padding=(0,0)),
             torch.nn.Sigmoid()
         )
 
@@ -92,110 +93,98 @@ class VFM(nn.Module):
         eps = Variable(eps).cuda()
         return eps.mul(std).add_(mu)
 
-        #        | | | | |
-        #+-+-+-+-+-+-+-+-+
-        #| | | | | 
-
     def encode(self, x, acts_encode, acts_decode):
-        #print(x.size())
-        x = x.view(self.batch_size*self.in_len, 3, self.img_size, self.img_size)
-        h = self.en(x)
+        h = self.q_en(x.view(self.batch_size*self.in_len, 3, self.img_size, self.img_size))
 
         img_enc = h.view(-1, s)
-        img_enc = self.en2(img_enc)
-
-        hs = []
+        img_enc = self.q_en2(img_enc)
+ 
+        q_means = []
+        q_logvars = []
+        gen_imgs = []
+        pred_imgs = []
 
         rnn_h = Variable(torch.zeros(self.batch_size, self.rnn_size)).cuda()
-        rnn_c = Variable(torch.zeros(self.batch_size, self.rnn_size)).cuda()
+        #rnn_c = Variable(torch.zeros(self.batch_size, self.rnn_size)).cuda()
         img_enc = img_enc.view(self.batch_size, self.in_len, -1)
 
         for i in range(self.in_len):
-            rnn_h, rnn_c = self.rnn_cell(torch.cat([img_enc[:, i, :], acts_encode[:, i, :]], 1), (rnn_h, rnn_c))
-            #rnn_h = self.h2h(rnn_h) * self.a2h(acts_encode[:, i, :])
-            hs.append(rnn_h)
-
-        gen_imgs = []
-        means = []
-        logvars = []
-        rnn_h = Variable(rnn_h.data, requires_grad=False)
-
-        #     -2-1
-        #        | | | | |
-        #+-+-+-+-+-+-+-+-+
-        #| | | | | 
-
-        if var:
-            mean = self.mean(hs[-2])
-            logvar = self.logvar(hs[-2])
-            means.append(mean)
-            logvars.append(logvar)
+            rnn_h = self.rnn_cell(torch.cat([img_enc[:, i, :], acts_encode[:, i, :]], 1), rnn_h)
+            mean = self.qz_mean(rnn_h)
+            logvar = self.qz_logvar(rnn_h)
             z = self.reparameterize(mean, logvar)
-            #print(z.size(), acts_encode[:, -1, :].size())
-            img_pred = self.de(torch.cat([z, acts_encode[:, -1, :]], 1))
-        else:
-            img_pred = self.de(h)
+            #q_zs.append(z)
+            q_means.append(mean)
+            q_logvars.append(logvar)
 
-        img_pred = self.de2(img_pred.view(self.batch_size, 32, size, size))
-        gen_imgs.append(img_pred)
-        img_pred = Variable(img_pred[:, :3, ...].data, requires_grad=False)
-        #print(img_pred.size())
-        img_enc = self.en(img_pred)
-        img_enc = self.en2(img_enc.view(-1, s))
-
-        for i in range(self.out_len-1):
-            #rnn_h = self.h2h(rnn_h) * self.a2h(acts_decode[:, i, :])
-            
-
-            if i == 0:
-                h_z = hs[-1]
-            else:
-                h_z = rnn_h
-                rnn_h, rnn_c = self.rnn_cell(torch.cat([img_enc, acts_decode[:, i, :]], 1), (rnn_h, rnn_c))
-
-            mean = self.mean(h_z)
-            logvar = self.logvar(h_z)
-            means.append(mean)
-            logvars.append(logvar)
-            z = self.reparameterize(mean, logvar)
-            #print(z.size(), acts_decode[:, i, :].size())
-            img_pred = self.de(torch.cat([z, acts_decode[:, i, :]], 1))
+            img_pred = self.de(z)
             img_pred = self.de2(img_pred.view(self.batch_size, 32, size, size))
-            
+            #gen_imgs.append(img_pred)
             gen_imgs.append(img_pred)
-            img_pred = Variable(img_pred[:, :3, ...].data, requires_grad=False)
-            img_enc = self.en(img_pred)
-            img_enc = self.en2(img_enc.view(-1, s))            
 
-        gen_imgs = torch.stack(gen_imgs, 1)
-        mean = torch.stack(means, 0)
-        logvar = torch.stack(logvars, 0)
-        #mean = mean.view(self.out_len, self.batch_size, -1)
-        #logvar = logvar.view(self.out_len, self.batch_size, -1)
+        q_z = z
 
-        #print(mean)
+        p_means = []
+        p_logvars = []
+        p_zs = []
+        curr_z = self.reparameterize(Variable(torch.zeros(self.batch_size, self.z_size).float()).cuda(),
+            Variable(torch.zeros(self.batch_size, self.z_size)).cuda())
 
-        return gen_imgs, mean, logvar
+        for i in range(self.in_len):
+            h = self.pz_en(torch.cat([curr_z, acts_encode[:, i, :]], 1))
+            mean = self.pz_mean(h)
+            logvar = self.pz_logvar(h)
+            curr_z = self.reparameterize(mean, logvar)
+            p_zs.append(curr_z)
+            p_means.append(mean)
+            p_logvars.append(logvar)
+
+        for i in range(self.out_len):
+            h = self.pz_en(torch.cat([q_z, acts_decode[:, i, :]], 1))
+            mean = self.pz_mean(h)
+            logvar = self.pz_logvar(h)
+            curr_z = self.reparameterize(mean, logvar)
+
+            img_pred = self.de(curr_z)
+            img_pred = self.de2(img_pred.view(self.batch_size, 32, size, size))
+            pred_imgs.append(img_pred)
+
+        gen_imgs = torch.stack(gen_imgs, dim=1)
+        pred_imgs = torch.stack(pred_imgs, dim=1)
+        q_means = torch.stack(q_means, dim=1)
+        q_logvars = torch.stack(q_logvars, dim=1)
+        p_means = torch.stack(p_means, dim=1)
+        p_logvars = torch.stack(p_logvars, dim=1)
+
+        return gen_imgs, pred_imgs, q_means, q_logvars, p_means, p_logvars
 
     def forward(self, x, acts_encode, acts_decode):
-        out, mean, logvar = self.encode(x, acts_encode, acts_decode)
+        return self.encode(x, acts_encode, acts_decode)
 
-        return out, mean, logvar
+    def kld(self, m1, v1, m2, v2):
+        s1 = v1.exp()
+        s2 = v2.exp()
 
-    def loss(self, x, recon, mean, logvar):
-        a = recon[:, :, :3, ...].contiguous().view(-1, 3, 210, 210)
-        b = x.view(-1, 3, 210, 210)
-        mse = self.reconstruction_function(a, b)
-        #mse = (b.mul(a.log()).add(b.mul(-1).add(1).mul(a.log().mul(-1).add(1))))
-        
-        #mse = mse.sum(1).mean()
-        #print(mse.data)
-        #mse = (x - recon[:, :, :3, ...])**2.0
-        #mse = (a + recon[:, :, 3:, ...]).mul(0.5)
-        #mse = mse.sum(1).mean()#.sum(2).sum(3).sum(4).mean()
+        return torch.log(s2) - torch.log(s1) + (s1.pow(2)+(m1-m2).pow(2))/(2.0*s2.pow(2)+1e-5) - 0.5
 
-        mean = mean.view(-1, self.z_size)
-        logvar = logvar.view(-1, self.z_size)
-        KLD_element = mean.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-        KLD = KLD_element.sum().mul_(-0.5)
-        return mse + KLD, mse, KLD
+    def loss(self, x, recon, q_means, q_logvars, p_means, p_logvars):
+        bce = -(x * torch.log(recon) + (1.0 - x) * torch.log(1.0 - recon))
+
+        def reform(xx):
+            return Variable(xx.data).cuda()#Variable(xx.view(-1, self.z_size).data).cuda()
+
+        q_means = reform(q_means)
+        q_logvars = reform(q_logvars)
+        #p_means = p_means.view(-1, self.z_size)
+        #p_logvars = p_logvars.view(-1, self.z_size)
+
+        kld = self.kld(q_means, q_logvars, p_means, p_logvars)
+
+        bce = bce.sum(4).sum(3).sum(2).mean(1).mean(0)
+        kld = kld.sum(2).sum(1).mean(0)
+        #KLD = KLD * 1e2
+        #bce = bce * 1e-2
+
+        #print(KLD)
+
+        return bce + kld, bce, kld
